@@ -1,5 +1,6 @@
 # 2025_Maker_Practice_Lab 🚀🚀🚀
-   #### Security Maker Practice Experiment for the Third Semester of 2025, National School of Cyber Security, Wuhan University 😎🥰👻🥳
+   #### Security Maker Practice Experiment for the Third Semester of 2025, National School of Cyber Security, Wuhan University
+   #### 😎🥰👻🥳 无敌的 “蒜头君的小弟”
 
 ## 一、黑白棋实验说明
 
