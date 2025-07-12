@@ -1,0 +1,3 @@
+cd ls_demo
+cd ..
+exit 

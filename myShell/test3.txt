@@ -1,0 +1,5 @@
+ls
+args arg1
+!l
+!lll
+exit 
