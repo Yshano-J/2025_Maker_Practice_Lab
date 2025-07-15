@@ -2,33 +2,58 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 #include "../include/playerbase.h"
 
 #define MAXN 70
 #define INF 1000000
 
+// 极限高分常量
+#define ULTRA_TARGET_SCORE 10000
+#define EXTREME_LOW_THRESHOLD 1500    // 1500分以下极度激进
+#define ULTRA_LOW_THRESHOLD 3000      // 3000分以下超级激进
+#define HIGH_PERFORMANCE_THRESHOLD 6000  // 6000分以上保持攻击性
+
 static int star_eaten[MAXN][MAXN];
+static int last_x = -1, last_y = -1;
+static int step_count = 0;
+static int consecutive_low_score = 0;
 
-static const int dx[4] = {-1, 0, 1, 0};
-static const int dy[4] = {0, 1, 0, -1};
+// 极限时间优化 - 100ms满载运行
+static clock_t start_time;
+static const int MAX_TIME_LIMIT_MS = 90;  
 
-// A* 节点结构
-struct AStarNode {
-    int x, y;          // 节点在地图中的坐标
-    int g_cost;        // 从起点到当前节点的实际距离
-    int h_cost;        // 启发函数值（到目标的估计距离）
-    int f_cost;        // g_cost + h_cost（总评估成本）
-    int parent_x, parent_y;  // 父节点坐标（用于路径回溯）
-    int in_open;       // 是否在开放列表中
-    int in_closed;     // 是否在关闭列表中
-};
+const int dx[4] = {-1, 0, 1, 0};
+const int dy[4] = {0, 1, 0, -1};
 
-static struct AStarNode nodes[MAXN][MAXN];
-static int open_list[MAXN * MAXN * 2];
-static int open_size;
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+
+// 高性能路径追踪
+static int elite_path_x[50], elite_path_y[50];
+static int elite_path_count = 0;
+static int super_target_x = -1, super_target_y = -1;
+static int target_lock_duration = 0;
+
+// 鬼魂预测
+static int ghost_predicted_x[2][5], ghost_predicted_y[2][5];
+
+int is_timeout() {
+    clock_t current_time = clock();
+    double elapsed_ms = ((double)(current_time - start_time)) / CLOCKS_PER_SEC * 1000;
+    return elapsed_ms > MAX_TIME_LIMIT_MS;
+}
 
 void init(struct Player *player) {
     memset(star_eaten, 0, sizeof(star_eaten));
+    last_x = -1;
+    last_y = -1;
+    step_count = 0;
+    elite_path_count = 0;
+    super_target_x = -1;
+    super_target_y = -1;
+    target_lock_duration = 0;
+    consecutive_low_score = 0;
 }
 
 int is_valid(struct Player *player, int x, int y) {
@@ -40,312 +65,484 @@ int is_star(struct Player *player, int x, int y) {
     return (c == 'o' || c == 'O') && !star_eaten[x][y];
 }
 
-// 改进的启发函数，考虑墙体影响
-int heuristic(struct Player *player, int x1, int y1, int x2, int y2) {
-    int manhattan = abs(x1 - x2) + abs(y1 - y2);
-    
-    // 短距离时曼哈顿距离较准确
-    if (manhattan <= 3) {
-        return manhattan;
+// 高性能路径记录
+void record_elite_path(int x, int y) {
+    if (elite_path_count >= 50) {
+        for (int i = 0; i < 49; i++) {
+            elite_path_x[i] = elite_path_x[i + 1];
+            elite_path_y[i] = elite_path_y[i + 1];
+        }
+        elite_path_count = 49;
     }
-    
-    // 检查直线路径上的墙体密度
-    int wall_penalty = 0;
-    int dx = (x2 > x1) ? 1 : ((x2 < x1) ? -1 : 0);
-    int dy = (y2 > y1) ? 1 : ((y2 < y1) ? -1 : 0);
-    
-    int steps = (abs(x2 - x1) > abs(y2 - y1)) ? abs(x2 - x1) : abs(y2 - y1);
-    int wall_count = 0;
-    
-    for (int i = 1; i <= steps && i <= 10; i++) {  // 只检查前10步，避免过度计算
-        int check_x = x1 + dx * i;
-        int check_y = y1 + dy * i;
-        
-        if (check_x >= 0 && check_x < player->row_cnt && 
-            check_y >= 0 && check_y < player->col_cnt) {
-            if (player->mat[check_x][check_y] == '#') {
-                wall_count++;
-            }
+    elite_path_x[elite_path_count] = x;
+    elite_path_y[elite_path_count] = y;
+    elite_path_count++;
+}
+
+// 检查最近路径重复
+int recent_path_penalty(int x, int y) {
+    int penalty = 0;
+    int check_recent = min(8, elite_path_count);
+    for (int i = elite_path_count - check_recent; i < elite_path_count; i++) {
+        if (elite_path_x[i] == x && elite_path_y[i] == y) {
+            penalty += (10 - (elite_path_count - i)) * 30;
         }
     }
-    
-    // 根据墙体数量调整距离估计
-    wall_penalty = wall_count * 2;  // 每个墙增加2的惩罚
-    
-    return manhattan + wall_penalty;
+    return penalty;
 }
 
-// 计算到破坏者的最短距离（用于风险评估）
-int distance_to_ghost(struct Player *player, int x, int y) {
-    int min_dist = INF;
-    for (int i = 0; i < 2; i++) {
-        int dist = heuristic(player, x, y, player->ghost_posx[i], player->ghost_posy[i]);
-        if (dist < min_dist) min_dist = dist;
+// 多步骤鬼魂行为预测
+void predict_ghost_moves(struct Player *player) {
+    for (int ghost_id = 0; ghost_id < 2; ghost_id++) {
+        int gx = player->ghost_posx[ghost_id];
+        int gy = player->ghost_posy[ghost_id];
+        
+        ghost_predicted_x[ghost_id][0] = gx;
+        ghost_predicted_y[ghost_id][0] = gy;
+        
+        // 预测4步
+        for (int step = 1; step <= 4; step++) {
+            // 简化：假设鬼魂向玩家移动
+            int target_x = player->your_posx;
+            int target_y = player->your_posy;
+            
+            int best_dist = INF;
+            int next_gx = gx, next_gy = gy;
+            
+            for (int d = 0; d < 4; d++) {
+                int new_gx = gx + dx[d];
+                int new_gy = gy + dy[d];
+                
+                if (is_valid(player, new_gx, new_gy)) {
+                    int dist = abs(new_gx - target_x) + abs(new_gy - target_y);
+                    if (dist < best_dist) {
+                        best_dist = dist;
+                        next_gx = new_gx;
+                        next_gy = new_gy;
+                    }
+                }
+            }
+            
+            ghost_predicted_x[ghost_id][step] = next_gx;
+            ghost_predicted_y[ghost_id][step] = next_gy;
+            gx = next_gx;
+            gy = next_gy;
+        }
     }
-    return min_dist;
 }
 
-// 评估星星的价值（贪心评估函数）
-float evaluate_star(struct Player *player, int sx, int sy, int star_x, int star_y) {
-    char star_type = player->mat[star_x][star_y];
-    int star_value = (star_type == 'O') ? 15 : 10;  // 超级星更有价值
+// 极限安全检查 - 根据分数动态调整
+int is_extremely_safe(struct Player *player, int x, int y, int future_step) {
+    if (!is_valid(player, x, y)) return 0;
     
-    int distance = heuristic(player, sx, sy, star_x, star_y);
-    int ghost_dist = distance_to_ghost(player, star_x, star_y);
-    int opponent_dist = heuristic(player, star_x, star_y, player->opponent_posx, player->opponent_posy);
-    
-    // 降低风险惩罚，避免过度保守
-    float danger_penalty = 0;
-    if (ghost_dist <= 2 && player->your_status <= 0) {
-        danger_penalty = 2.0 / (ghost_dist + 1);  // 降低惩罚
-    }
-    
-    // 竞争评估
-    float competition_penalty = 0;
-    if (opponent_dist < distance && player->opponent_status != -1) {
-        competition_penalty = 1.0;  // 降低竞争惩罚
-    }
-    
-    // 强化状态奖励
-    float power_bonus = 0;
+    // 强化状态：完全激进
     if (player->your_status > 0) {
-        power_bonus = 3.0;  // 强化状态下更积极
-        if (star_type == 'O') power_bonus += 2.0;
+        if (player->your_status > 5) return 1;  // 时间充足完全激进
+        // 即使时间不足也要激进，只避免直接碰撞
+        for (int i = 0; i < 2; i++) {
+            if (x == player->ghost_posx[i] && y == player->ghost_posy[i]) return 0;
+        }
+        return 1;
     }
     
-    // 距离奖励：优先近距离目标
-    float distance_bonus = 0;
-    if (distance <= 3) distance_bonus = 2.0;
+    // 根据分数调整安全距离
+    int required_distance;
+    if (player->your_score < EXTREME_LOW_THRESHOLD) {
+        required_distance = 1;  // 分数极低时只要求1格距离
+        consecutive_low_score++;
+    } else if (player->your_score < ULTRA_LOW_THRESHOLD) {
+        required_distance = 2;  // 分数较低时要求2格距离
+        consecutive_low_score = max(0, consecutive_low_score - 1);
+    } else {
+        required_distance = 3;  // 分数正常时要求3格距离
+        consecutive_low_score = 0;
+    }
     
-    // 综合评分：价值密度 - 风险 - 竞争 + 奖励
-    return (float)star_value / (distance + 1) - danger_penalty - competition_penalty + power_bonus + distance_bonus;
+    // 连续低分时进一步降低安全要求
+    if (consecutive_low_score > 10) {
+        required_distance = max(1, required_distance - 1);
+    }
+    
+    // 检查预测的鬼魂位置
+    for (int i = 0; i < 2; i++) {
+        int step = min(future_step, 4);
+        int ghost_x = ghost_predicted_x[i][step];
+        int ghost_y = ghost_predicted_y[i][step];
+        int dist = abs(x - ghost_x) + abs(y - ghost_y);
+        if (dist < required_distance) return 0;
+    }
+    
+    return 1;
 }
 
-// BFS备用寻路（简单但可靠）
-int bfs_backup(struct Player *player, int sx, int sy, int *next_x, int *next_y) {
-    int vis[MAXN][MAXN] = {0};
-    int prex[MAXN][MAXN], prey[MAXN][MAXN];
-    int qx[MAXN*MAXN], qy[MAXN*MAXN], head = 0, tail = 0;
+// 终极评分函数
+float ultimate_score_move(struct Player *player, int from_x, int from_y, int to_x, int to_y) {
+    if (!is_valid(player, to_x, to_y)) return -100000.0f;
     
-    qx[tail] = sx; qy[tail] = sy; tail++;
-    vis[sx][sy] = 1;
-    prex[sx][sy] = -1; prey[sx][sy] = -1;
+    float score = 0.0f;
     
-    while (head < tail) {
-        int x = qx[head], y = qy[head]; head++;
-        
-        if (is_star(player, x, y)) {
-            // 找到星星，回溯第一步
-            int px = x, py = y;
-            while (!(prex[px][py] == sx && prey[px][py] == sy)) {
-                int tpx = prex[px][py], tpy = prey[px][py];
-                px = tpx; py = tpy;
-            }
-            *next_x = px; *next_y = py;
-            return 1;
+    // 1. 超级星星价值 - 根据分数动态调整
+    if (is_star(player, to_x, to_y)) {
+        char star_type = player->mat[to_x][to_y];
+        if (star_type == 'O') {
+            score += 3000.0f;  // 大星星超高价值
+        } else {
+            score += 800.0f;   // 小星星高价值
         }
         
-        for (int d = 0; d < 4; d++) {
-            int nx = x + dx[d], ny = y + dy[d];
-            if (is_valid(player, nx, ny) && !vis[nx][ny]) {
-                vis[nx][ny] = 1;
-                prex[nx][ny] = x; prey[nx][ny] = y;
-                qx[tail] = nx; qy[tail] = ny; tail++;
+        // 分数不足时大幅提升星星价值
+        if (player->your_score < EXTREME_LOW_THRESHOLD) {
+            score *= 3.0f;
+        } else if (player->your_score < ULTRA_LOW_THRESHOLD) {
+            score *= 2.0f;
+        }
+    }
+    
+    // 2. 安全距离优化 - 更智能的风险评估
+    if (!is_extremely_safe(player, to_x, to_y, 0)) {
+    if (player->your_status > 0) {
+            score += 500.0f;  // 强化状态下鼓励冒险
+        } else {
+            // 分数导向的风险调整
+            if (player->your_score < EXTREME_LOW_THRESHOLD) {
+                score -= 200.0f;  // 极低分时适度惩罚危险
+            } else {
+                score -= 2000.0f; // 正常分数时严重惩罚危险
             }
         }
     }
+    
+    // 3. 附近星星聚合度
+    int nearby_stars = 0;
+    for (int radius = 1; radius <= 5; radius++) {
+        for (int i = max(0, to_x - radius); i <= min(player->row_cnt - 1, to_x + radius); i++) {
+            for (int j = max(0, to_y - radius); j <= min(player->col_cnt - 1, to_y + radius); j++) {
+                if (is_star(player, i, j)) {
+                    int dist = abs(i - to_x) + abs(j - to_y);
+                    if (dist <= radius) {
+                        nearby_stars++;
+                        score += (400.0f / (dist + 1)) * (6 - radius) / 5.0f;
+                    }
+                }
+            }
+        }
+    }
+    
+    // 4. 对手干扰 - 大幅强化
+    float interference_value = 0.0f;
+    if (player->opponent_score > 6000) {
+        interference_value = 1000.0f;  // 高分对手强力干扰
+    } else if (player->opponent_score > 3000) {
+        interference_value = 600.0f;
+    } else {
+        interference_value = 300.0f;
+    }
+    
+    int opp_dist = abs(to_x - player->opponent_posx) + abs(to_y - player->opponent_posy);
+    if (opp_dist <= 3) {
+        score += interference_value / (opp_dist + 1);
+    }
+    
+    // 5. 路径历史惩罚 - 强化版
+    int path_penalty = recent_path_penalty(to_x, to_y);
+    score -= path_penalty;
+    
+    // 6. 开阔区域和移动性
+    int mobility = 0;
+    for (int d = 0; d < 4; d++) {
+        int check_x = to_x + dx[d];
+        int check_y = to_y + dy[d];
+        if (is_valid(player, check_x, check_y)) {
+            mobility++;
+        }
+    }
+    score += mobility * 100.0f;
+    
+    // 7. 分数压力系统
+    if (player->your_score < EXTREME_LOW_THRESHOLD) {
+        score += 1000.0f;  // 极低分数时激进加分
+        if (nearby_stars > 0) {
+            score += 2000.0f;  // 有星星时超级加分
+        }
+    }
+    
+    // 8. 目标持续性奖励
+    if (to_x == super_target_x && to_y == super_target_y) {
+        score += 300.0f * target_lock_duration;
+    }
+    
+    return score;
+}
+
+// 超级A*寻路
+int super_astar_pathfind(struct Player *player, int start_x, int start_y, int target_x, int target_y, int *next_x, int *next_y) {
+    if (is_timeout()) return 0;
+    
+    static int g_cost[MAXN][MAXN], f_cost[MAXN][MAXN];
+    static int parent_x[MAXN][MAXN], parent_y[MAXN][MAXN];
+    static int open_x[500], open_y[500];  // 开放列表
+    static int closed[MAXN][MAXN];
+    
+    // 初始化
+    for (int i = 0; i < player->row_cnt; i++) {
+        for (int j = 0; j < player->col_cnt; j++) {
+            g_cost[i][j] = INF;
+            f_cost[i][j] = INF;
+            parent_x[i][j] = -1;
+            parent_y[i][j] = -1;
+            closed[i][j] = 0;
+        }
+    }
+    
+    g_cost[start_x][start_y] = 0;
+    f_cost[start_x][start_y] = abs(start_x - target_x) + abs(start_y - target_y);
+    
+    int open_size = 1;
+    open_x[0] = start_x;
+    open_y[0] = start_y;
+    
+    // 动态迭代次数
+    int max_iterations = 150;
+    if (player->your_score < EXTREME_LOW_THRESHOLD) {
+        max_iterations = 200;  // 低分时增加计算量
+    }
+    
+    int iterations = 0;
+    
+    while (open_size > 0 && iterations < max_iterations && !is_timeout()) {
+        iterations++;
+        
+        // 找最优节点
+        int best_idx = 0;
+        for (int i = 1; i < open_size; i++) {
+            if (f_cost[open_x[i]][open_y[i]] < f_cost[open_x[best_idx]][open_y[best_idx]]) {
+                best_idx = i;
+            }
+        }
+        
+        int current_x = open_x[best_idx];
+        int current_y = open_y[best_idx];
+        
+        // 移除当前节点
+        for (int i = best_idx; i < open_size - 1; i++) {
+            open_x[i] = open_x[i + 1];
+            open_y[i] = open_y[i + 1];
+        }
+        open_size--;
+        
+        closed[current_x][current_y] = 1;
+        
+        // 找到目标
+        if (current_x == target_x && current_y == target_y) {
+            int path_x = target_x, path_y = target_y;
+            while (parent_x[path_x][path_y] != -1) {
+                int px = parent_x[path_x][path_y];
+                int py = parent_y[path_x][path_y];
+                
+                if (px == start_x && py == start_y) {
+                    *next_x = path_x;
+                    *next_y = path_y;
+                    return 1;
+                }
+                
+                path_x = px;
+                path_y = py;
+            }
+        }
+        
+        // 扩展邻居
+        for (int d = 0; d < 4; d++) {
+            int nx = current_x + dx[d];
+            int ny = current_y + dy[d];
+            
+            if (!is_valid(player, nx, ny) || closed[nx][ny]) continue;
+            
+            // 安全检查 - 更宽松
+            if (!is_extremely_safe(player, nx, ny, 1) && player->your_status == 0) {
+                if (player->your_score >= ULTRA_LOW_THRESHOLD) continue;
+            }
+            
+            int tentative_g = g_cost[current_x][current_y] + 1;
+            
+            if (tentative_g < g_cost[nx][ny]) {
+                parent_x[nx][ny] = current_x;
+                parent_y[nx][ny] = current_y;
+                g_cost[nx][ny] = tentative_g;
+                f_cost[nx][ny] = tentative_g + abs(nx - target_x) + abs(ny - target_y);
+                
+                // 添加到开放列表
+                int found = 0;
+                for (int i = 0; i < open_size; i++) {
+                    if (open_x[i] == nx && open_y[i] == ny) {
+                        found = 1;
+                        break;
+                    }
+                }
+                
+                if (!found && open_size < 500) {
+                    open_x[open_size] = nx;
+                    open_y[open_size] = ny;
+                    open_size++;
+                }
+            }
+        }
+    }
+    
     return 0;
 }
 
-// 最小堆操作
-void heap_push(int node_idx) {
-    open_list[open_size++] = node_idx;
-    int pos = open_size - 1;
-    while (pos > 0) {
-        int parent = (pos - 1) / 2;
-        int curr_x = node_idx / MAXN, curr_y = node_idx % MAXN;
-        int parent_x = open_list[parent] / MAXN, parent_y = open_list[parent] % MAXN;
-        if (nodes[curr_x][curr_y].f_cost >= nodes[parent_x][parent_y].f_cost) break;
-        
-        int temp = open_list[pos];
-        open_list[pos] = open_list[parent];
-        open_list[parent] = temp;
-        pos = parent;
-    }
-}
-
-int heap_pop() {
-    if (open_size == 0) return -1;
-    int result = open_list[0];
-    open_list[0] = open_list[--open_size];
-    
-    int pos = 0;
-    while (pos * 2 + 1 < open_size) {
-        int left = pos * 2 + 1;
-        int right = pos * 2 + 2;
-        int smallest = pos;
-        
-        int pos_x = open_list[pos] / MAXN, pos_y = open_list[pos] % MAXN;
-        int left_x = open_list[left] / MAXN, left_y = open_list[left] % MAXN;
-        
-        if (nodes[left_x][left_y].f_cost < nodes[pos_x][pos_y].f_cost) {
-            smallest = left;
-        }
-        
-        if (right < open_size) {
-            int right_x = open_list[right] / MAXN, right_y = open_list[right] % MAXN;
-            int smallest_x = open_list[smallest] / MAXN, smallest_y = open_list[smallest] % MAXN;
-            if (nodes[right_x][right_y].f_cost < nodes[smallest_x][smallest_y].f_cost) {
-                smallest = right;
-            }
-        }
-        
-        if (smallest == pos) break;
-        
-        int temp = open_list[pos];
-        open_list[pos] = open_list[smallest];
-        open_list[smallest] = temp;
-        pos = smallest;
-    }
-    
-    return result;
-}
-
-// A* 寻路算法
-int Astar(struct Player *player, int sx, int sy, int tx, int ty, int *next_x, int *next_y) {
-    // 初始化节点
-    for (int i = 0; i < player->row_cnt; i++) {
-        for (int j = 0; j < player->col_cnt; j++) {
-            nodes[i][j].x = i;
-            nodes[i][j].y = j;
-            nodes[i][j].g_cost = INF;
-            nodes[i][j].h_cost = heuristic(player, i, j, tx, ty);
-            nodes[i][j].f_cost = INF;
-            nodes[i][j].parent_x = -1;
-            nodes[i][j].parent_y = -1;
-            nodes[i][j].in_open = 0;
-            nodes[i][j].in_closed = 0;
-        }
-    }
-    
-    // 起点
-    nodes[sx][sy].g_cost = 0;
-    nodes[sx][sy].f_cost = nodes[sx][sy].h_cost;
-    nodes[sx][sy].in_open = 1;
-    
-    open_size = 0;
-    heap_push(sx * MAXN + sy); // 如果直接存储坐标对，堆操作会很复杂，所以用一个一维数组来存储
-    
-    while (open_size > 0) {
-        int current_idx = heap_pop();
-        int x = current_idx / MAXN, y = current_idx % MAXN;
-        
-        nodes[x][y].in_open = 0;
-        nodes[x][y].in_closed = 1;
-        
-        if (x == tx && y == ty) {
-            // 回溯路径找到第一步
-            int px = tx, py = ty;
-            while (nodes[px][py].parent_x != sx || nodes[px][py].parent_y != sy) {
-                int temp_x = nodes[px][py].parent_x;
-                int temp_y = nodes[px][py].parent_y;
-                px = temp_x;
-                py = temp_y;
-            }
-            *next_x = px;
-            *next_y = py;
-            return 1;
-        }
-        
-        // 探索邻居
-        for (int d = 0; d < 4; d++) {
-            int nx = x + dx[d], ny = y + dy[d];
-            if (!is_valid(player, nx, ny) || nodes[nx][ny].in_closed) continue;
-            
-            int new_g_cost = nodes[x][y].g_cost + 1;
-            
-            if (!nodes[nx][ny].in_open || new_g_cost < nodes[nx][ny].g_cost) {
-                nodes[nx][ny].g_cost = new_g_cost;
-                nodes[nx][ny].f_cost = new_g_cost + nodes[nx][ny].h_cost;
-                nodes[nx][ny].parent_x = x;
-                nodes[nx][ny].parent_y = y;
-                
-                if (!nodes[nx][ny].in_open) {
-                    nodes[nx][ny].in_open = 1;
-                    heap_push(nx * MAXN + ny);
-                }
-            }
-        }
-    }
-    
-    return 0;  // 找不到路径
-}
-
 struct Point walk(struct Player *player) {
-    int x = player->your_posx, y = player->your_posy;
+    start_time = clock();
+    step_count++;
     
-    // 标记当前位置的星星为已吃
-    if (is_star(player, x, y)) {
-        star_eaten[x][y] = 1;
+    int x = player->your_posx;
+    int y = player->your_posy;
+    
+    // 更新路径历史
+    record_elite_path(x, y);
+    
+    // 预测鬼魂移动
+    predict_ghost_moves(player);
+    
+    // 标记吃掉的星星
+    if (last_x != -1 && last_y != -1 && is_star(player, last_x, last_y)) {
+        star_eaten[last_x][last_y] = 1;
     }
     
-    // 寻找最优目标星星
-    int best_star_x = -1, best_star_y = -1;
-    float best_score = -1000.0;
+    // 超级目标搜索 - 扩大范围和价值评估
+    int best_target_x = -1, best_target_y = -1;
+    float best_target_value = -1.0f;
     
-    for (int i = 0; i < player->row_cnt; i++) {
-        for (int j = 0; j < player->col_cnt; j++) {
-            if (is_star(player, i, j)) {
-                float score = evaluate_star(player, x, y, i, j);
-                if (score > best_score) {
-                    best_score = score;
-                    best_star_x = i;
-                    best_star_y = j;
+    int search_radius = (player->your_score < EXTREME_LOW_THRESHOLD) ? 10 : 8;
+    
+    for (int i = max(0, x - search_radius); i <= min(player->row_cnt - 1, x + search_radius) && !is_timeout(); i++) {
+        for (int j = max(0, y - search_radius); j <= min(player->col_cnt - 1, y + search_radius); j++) {
+            if (!is_star(player, i, j)) continue;
+            
+            int dist = abs(i - x) + abs(j - y);
+            if (dist == 0) continue;
+            
+            float value = 0.0f;
+            
+            // 星星基础价值
+            char star_type = player->mat[i][j];
+            if (star_type == 'O') {
+                value = 5000.0f / (dist + 1);
+            } else {
+                value = 1500.0f / (dist + 1);
+            }
+            
+            // 分数不足时提升价值
+            if (player->your_score < EXTREME_LOW_THRESHOLD) {
+                value *= 4.0f;
+            } else if (player->your_score < ULTRA_LOW_THRESHOLD) {
+                value *= 2.5f;
+            }
+            
+            // 安全性考虑
+            if (!is_extremely_safe(player, i, j, min(3, dist/3))) {
+                if (player->your_status == 0) {
+                    value *= 0.3f;  // 危险位置降低价值
+                } else {
+                    value *= 1.5f;  // 强化状态提升价值
+                }
+            }
+            
+            // 聚合奖励
+            int nearby_count = 0;
+            for (int di = i - 3; di <= i + 3; di++) {
+                for (int dj = j - 3; dj <= j + 3; dj++) {
+                    if (is_star(player, di, dj) && (di != i || dj != j)) {
+                        nearby_count++;
+                    }
+                }
+            }
+            value += nearby_count * 200.0f;
+            
+            if (value > best_target_value) {
+                best_target_value = value;
+                best_target_x = i;
+                best_target_y = j;
+            }
+        }
+    }
+    
+    // 目标锁定系统
+    if (best_target_x == super_target_x && best_target_y == super_target_y) {
+        target_lock_duration++;
+    } else {
+        target_lock_duration = 0;
+        super_target_x = best_target_x;
+        super_target_y = best_target_y;
+    }
+    
+    // 使用A*寻路到目标
+    if (best_target_x != -1) {
+        int next_x, next_y;
+        if (super_astar_pathfind(player, x, y, best_target_x, best_target_y, &next_x, &next_y)) {
+                struct Point ret = {next_x, next_y};
+                return ret;
+            }
+    }
+    
+    // A*失败时使用终极贪心策略
+    int final_x = x, final_y = y;
+    float final_score = -1000000.0f;
+    
+    for (int d = 0; d < 4 && !is_timeout(); d++) {
+        int nx = x + dx[d];
+        int ny = y + dy[d];
+        
+        if (!is_valid(player, nx, ny)) continue;
+        
+        float score = ultimate_score_move(player, x, y, nx, ny);
+        
+        if (score > final_score) {
+            final_score = score;
+            final_x = nx;
+            final_y = ny;
+        }
+    }
+    
+    // 绝对最后的安全移动
+    if (final_x == x && final_y == y) {
+    for (int d = 0; d < 4; d++) {
+            int nx = x + dx[d];
+            int ny = y + dy[d];
+        if (is_valid(player, nx, ny)) {
+                // 检查最低安全要求
+                int min_dist = INF;
+                for (int i = 0; i < 2; i++) {
+                    int dist = abs(nx - player->ghost_posx[i]) + abs(ny - player->ghost_posy[i]);
+                    min_dist = min(min_dist, dist);
+                }
+                
+                int required = (player->your_score < EXTREME_LOW_THRESHOLD) ? 1 : 2;
+                if (min_dist >= required || player->your_status > 0) {
+                    final_x = nx;
+                    final_y = ny;
+                    break;
                 }
             }
         }
     }
     
-    // 如果找到目标星星，优先用A*寻路
-    if (best_star_x != -1) {
-        int next_x, next_y;
-        if (Astar(player, x, y, best_star_x, best_star_y, &next_x, &next_y)) {
-            struct Point ret = {next_x, next_y};
-            return ret;
-        }
-    }
-    
-    // A*失败，尝试BFS找任意星星
-    int next_x, next_y;
-    if (bfs_backup(player, x, y, &next_x, &next_y)) {
-        struct Point ret = {next_x, next_y};
-        return ret;
-    }
-    
-    // 没有星星可达，智能探索策略
-    int explore_x = x, explore_y = y;
-    int max_score = -1000;
-    
-    for (int d = 0; d < 4; d++) {
-        int nx = x + dx[d], ny = y + dy[d];
-        if (is_valid(player, nx, ny)) {
-            int ghost_dist = distance_to_ghost(player, nx, ny);
-            int explore_score = ghost_dist;  // 优先远离破坏者
-            
-            // 倾向于向地图中心移动
-            int center_x = player->row_cnt / 2;
-            int center_y = player->col_cnt / 2;
-            int center_dist = abs(nx - center_x) + abs(ny - center_y);
-            explore_score -= center_dist / 2;
-            
-            if (explore_score > max_score) {
-                max_score = explore_score;
-                explore_x = nx;
-                explore_y = ny;
+    // 最终保护
+    if (final_x == x && final_y == y) {
+        for (int d = 0; d < 4; d++) {
+            int nx = x + dx[d];
+            int ny = y + dy[d];
+            if (is_valid(player, nx, ny)) {
+                final_x = nx;
+                final_y = ny;
+                break;
             }
         }
     }
     
-    struct Point ret = {explore_x, explore_y};
+    last_x = x;
+    last_y = y;
+    
+    struct Point ret = {final_x, final_y};
     return ret;
 }
